@@ -891,7 +891,7 @@ export class AIOrchestrator {
           const customerName = accountData.name || (lowerMessage.includes("jatin") ? "Jatin Deshmukh" : (lowerMessage.includes("baby") ? "Mr. Baby Kumar" : "Mr. Ryan Gates"));
           const tier = accountData["Customer Tier"] || "Gold";
           const employment = accountData["Employment Type"] || "Salaried";
-          const cltvVal = accountData.cltv !== undefined ? String(accountData.cltv) : "262.5";
+          const cltvVal = accountData.cltv !== undefined && accountData.cltv !== null ? String(accountData.cltv) : "262.5";
           const churnVal = accountData["Churn Propensity Segment"] || "Likely to Churn";
           const nboVal = accountData["Next Best Offer"] || "Pre-approved Top Up!";
           const phone = accountData["Mobile Phone"] || accountData.phone || "9971600404";

@@ -36,6 +36,19 @@ import { UIComponent, SuggestedAction } from "@/lib/ai/ui-schema";
 
 const CHART_COLORS = ["#E71A73", "#2E7D32", "#F59E0B", "#3B82F6", "#8B5CF6", "#EF4444", "#14B8A6"];
 
+// A field is only worth rendering if it actually has content. Guards against CRM
+// records that come back with a null/missing value from the MCP server ending up
+// literally displayed as the text "null"/"undefined" in a card.
+function hasValue(v: any): boolean {
+  if (v === null || v === undefined) return false;
+  if (typeof v === "string") {
+    const trimmed = v.trim().toLowerCase();
+    return trimmed !== "" && trimmed !== "null" && trimmed !== "undefined" && trimmed !== "nan";
+  }
+  if (typeof v === "number") return !Number.isNaN(v);
+  return true;
+}
+
 // Normalizes several shapes the LLM might send (array of {key,value}, plain object, or
 // already-chart-shaped rows) into recharts-friendly rows: [{ name, value }, ...]
 function normalizeChartData(data: any): { name: string; value: number }[] {
@@ -213,24 +226,30 @@ function RenderSingleComponent({
         </div>
       );
 
-    case "metric_group":
+    case "metric_group": {
+      // auto-fit sizes tiles off the actual space available (works whether this
+      // renders in the full-width canvas or a narrow 672px drawer) instead of a
+      // fixed 5-column grid keyed to the browser viewport, which is what was
+      // forcing "Individual" / "Apartment" etc. to truncate mid-word.
+      const metricItems = (data || []).filter((m: any) => hasValue(m?.value));
       return (
-        <div className="grid gap-4 grid-cols-2 md:grid-cols-5 w-full">
-          {(data || []).map((m: any, idx: number) => (
-            <div 
-              key={idx} 
-              className="rounded-2xl border border-gray-100 bg-white px-5 py-4 text-left shadow-sm hover:shadow-md transition-all"
+        <div className="grid gap-3 grid-cols-[repeat(auto-fit,minmax(135px,1fr))] w-full">
+          {metricItems.map((m: any, idx: number) => (
+            <div
+              key={idx}
+              className="min-w-0 rounded-2xl border border-gray-100 bg-white px-4 py-3.5 text-left shadow-sm hover:shadow-md transition-all"
             >
-              <div className="text-[10px] font-extrabold uppercase tracking-wider text-[#757575] font-poppins truncate">
+              <div className="text-[10px] font-bold uppercase tracking-wider text-[#757575] font-poppins leading-tight">
                 {m.label}
               </div>
-              <div className="text-lg font-black text-gray-800 font-poppins mt-1 truncate" title={String(m.value)}>
+              <div className="text-base font-black text-gray-800 font-poppins mt-1.5 leading-snug break-words">
                 {m.value}
               </div>
             </div>
           ))}
         </div>
       );
+    }
 
     case "account_summary":
       return (
@@ -241,10 +260,10 @@ function RenderSingleComponent({
             </div>
           )}
           <div className="p-5 space-y-3.5">
-            {Object.entries(data || {}).map(([key, value]: any) => (
-              <div key={key} className="flex justify-between py-1.5 border-b border-gray-50 last:border-none text-xs font-poppins font-medium">
-                <span className="text-[#757575] font-bold flex items-center capitalize">{key.replace("_", " ")}</span>
-                <span className="text-gray-800 font-extrabold text-right truncate max-w-[200px]" title={String(value)}>
+            {Object.entries(data || {}).filter(([, value]) => hasValue(value)).map(([key, value]: any) => (
+              <div key={key} className="flex justify-between gap-3 py-1.5 border-b border-gray-50 last:border-none text-xs font-poppins font-medium">
+                <span className="text-[#757575] font-bold flex items-center capitalize shrink-0">{key.replace(/_/g, " ")}</span>
+                <span className="text-gray-800 font-extrabold text-right break-words max-w-[220px]">
                   {value}
                 </span>
               </div>
@@ -254,11 +273,12 @@ function RenderSingleComponent({
       );
 
     case "key_value_grid":
-      const gridItems = Array.isArray(data)
+      const gridItems = (Array.isArray(data)
         ? data
         : typeof data === "object" && data !== null
         ? Object.entries(data).map(([key, value]) => ({ key, value }))
-        : [];
+        : []
+      ).filter((item: any) => hasValue(item?.value));
 
       const isCreditRatings = title?.toUpperCase().includes("CREDIT RATINGS");
 
