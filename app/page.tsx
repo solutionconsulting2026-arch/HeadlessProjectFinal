@@ -5,7 +5,7 @@ import Shell from "@/components/businessnext/shell";
 import CommandBar from "@/components/businessnext/command-bar";
 import Canvas from "@/components/businessnext/canvas";
 import Login from "@/components/businessnext/login";
-import LoadingScreen from "@/components/businessnext/loading-screen";
+import LoadingScreen, { InlineThinkingIndicator, LOADING_STAGES } from "@/components/businessnext/loading-screen";
 import LeadDrawer from "@/components/businessnext/lead-drawer";
 import { AIWorkspaceResponse } from "@/lib/ai/ui-schema";
 import { 
@@ -28,6 +28,7 @@ export default function WorkspaceHome() {
 
   const [loading, setLoading] = useState(false);
   const [loadingStage, setLoadingStage] = useState("");
+  const [loadingStageIndex, setLoadingStageIndex] = useState(0);
 
   // Chat-style feed: every turn stays on screen (appended below the previous one)
   // instead of a single response replacing the last one.
@@ -100,19 +101,14 @@ export default function WorkspaceHome() {
     setActionError(null);
 
     // Sequence loading stages to show real activity progress
-    const stages = [
-      "Understanding query...",
-      "Executing MCP tools...",
-      "Retrieving account data...",
-      "Rendering account insights..."
-    ];
-
     let stageIdx = 0;
-    setLoadingStage(stages[0]);
+    setLoadingStage(LOADING_STAGES[0]);
+    setLoadingStageIndex(0);
     const stageInterval = setInterval(() => {
       stageIdx++;
-      if (stageIdx < stages.length) {
-        setLoadingStage(stages[stageIdx]);
+      if (stageIdx < LOADING_STAGES.length) {
+        setLoadingStage(LOADING_STAGES[stageIdx]);
+        setLoadingStageIndex(stageIdx);
       }
     }, 800);
 
@@ -343,14 +339,11 @@ export default function WorkspaceHome() {
               {loading && (
                 turns.length === 0 ? (
                   /* First query in the conversation: full premium loading layout */
-                  <LoadingScreen stage={loadingStage} />
+                  <LoadingScreen stageIndex={loadingStageIndex} />
                 ) : (
-                  /* Follow-up query: a small inline indicator appended below existing turns,
+                  /* Follow-up query: a shimmering skeleton card appended below existing turns,
                      so earlier Customer 360 / lookup cards never disappear while it loads. */
-                  <div className="flex items-center gap-3 rounded-xl border border-[#E5E7EB] bg-white px-5 py-4 shadow-sm self-start">
-                    <span className="h-2 w-2 rounded-full bg-[#E71A73] animate-pulse" />
-                    <span className="text-xs font-semibold text-[#757575]">{loadingStage || "Thinking..."}</span>
-                  </div>
+                  <InlineThinkingIndicator stageIndex={loadingStageIndex} />
                 )
               )}
 
