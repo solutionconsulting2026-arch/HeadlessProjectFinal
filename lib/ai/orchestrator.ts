@@ -117,6 +117,51 @@ export class AIOrchestrator {
     return `\n\n### CACHED CRM CONTEXT (already fetched this conversation)\n${JSON.stringify(serialized)}`;
   }
 
+  // Pulls a real name/phone out of the most recently fetched CRM entity for this
+  // conversation, so "create a lead for that customer" reuses the actual record instead
+  // of falling back to a hardcoded demo name.
+  private getLastCachedContact(conversationId: string): { name: string; lastName: string; phone?: string } | null {
+    const list = this.entityCache.get(conversationId);
+    if (!list || list.length === 0) return null;
+    const entity = list[list.length - 1];
+    const raw = entity.rawResult;
+
+    let data: any;
+    if (entity.toolName === "get_retail_lead") {
+      data = raw?.lead?.result?.[0] || raw?.lead || raw;
+    } else {
+      data = raw?.account?.result?.[0] || raw?.account || raw;
+    }
+
+    const fullName = data?.name || data?.Name || data?.["Lead Name"];
+    if (!fullName) return null;
+
+    const parts = String(fullName).trim().split(/\s+/);
+    const phone = data?.["Mobile Phone"] || data?.phone || data?.Phone;
+
+    return {
+      name: parts[0],
+      lastName: parts.slice(1).join(" ") || parts[0],
+      phone: phone !== undefined && phone !== null ? String(phone) : undefined,
+    };
+  }
+
+  // Reads the product the user actually asked for out of the message text, instead of
+  // always defaulting to a generic loan product regardless of what was requested.
+  private detectRequestedProduct(message: string, mode: "corporate" | "retail"): string {
+    const m = message.toLowerCase();
+    if (m.includes("credit card")) return "Credit Card";
+    if (m.includes("home loan") || m.includes("mortgage")) return "Home Loan";
+    if (m.includes("auto loan") || m.includes("car loan") || m.includes("vehicle loan")) return "Auto Loan";
+    if (m.includes("savings account") || m.includes("savings")) return "Savings Account";
+    if (m.includes("current account") || m.includes("checking account")) return "Current Account";
+    if (m.includes("demat")) return "Demat Account";
+    if (m.includes("insurance")) return "Insurance";
+    if (m.includes("sme financing") || m.includes("business loan") || m.includes("corporate financing")) return "Corporate SME Financing";
+    if (m.includes("personal loan")) return mode === "retail" ? "Personal Loan" : "Personal Loan for Salaried Customers";
+    return mode === "retail" ? "Home Loan" : "Personal Loan for Salaried Customers";
+  }
+
   private filterCrmTools(mcpTools: McpTool[], mode: "corporate" | "retail"): McpTool[] {
     return mcpTools.filter((t) => {
       if (mode === "retail") {
@@ -736,11 +781,22 @@ export class AIOrchestrator {
 
     // 2. LEAD CREATION INTENT (Common to both modes)
     if (lowerMessage.includes("create") || lowerMessage.includes("save") || (lowerMessage.includes("lead") && !lowerMessage.includes("show") && !lowerMessage.includes("find") && !lowerMessage.includes("get") && !message.match(/\b\d{5}\b/))) {
-      const names = message.match(/lead (?:for|called) ([A-Za-z]+)\s*([A-Za-z]*)/i) || [];
-      const name = names[1] || "Anushka";
-      const lastName = names[2] || "Singhania";
+      // Explicit "lead for First Last" always wins. Otherwise, if the message references
+      // an already-established entity ("that customer", "them", or just no name at all),
+      // reuse the real record from this conversation's cache instead of a demo placeholder.
+      // A pronoun/placeholder stoplist keeps "lead for that customer" from being
+      // misread as a literal first/last name ("That Customer").
+      const PRONOUN_STOPLIST = new Set(["that", "this", "them", "him", "her", "the", "same", "said", "customer", "client", "account", "lead"]);
+      const rawNameMatch = message.match(/lead (?:for|called) ([A-Za-z]+)\s*([A-Za-z]*)/i) || [];
+      const isRealName = !!rawNameMatch[1] && !PRONOUN_STOPLIST.has(rawNameMatch[1].toLowerCase());
+      const cachedContact = this.getLastCachedContact(conversationId);
+      const name = (isRealName && rawNameMatch[1]) || cachedContact?.name || "Anushka";
+      const lastName = (isRealName && rawNameMatch[2]) || cachedContact?.lastName || "Singhania";
       const phoneMatch = message.match(/(\d[\d-\s]{7,\d})/);
-      const mobilePhone = phoneMatch ? phoneMatch[0].trim() : "9999927066";
+      // Only reuse the cached phone when we're actually reusing that cached person's name too —
+      // an explicit different name shouldn't inherit someone else's phone number.
+      const mobilePhone = phoneMatch ? phoneMatch[0].trim() : (!isRealName && cachedContact?.phone) || "9999927066";
+      const product = this.detectRequestedProduct(message, mode);
 
       return {
         version: "1.0",
@@ -758,7 +814,7 @@ export class AIOrchestrator {
                 name,
                 last_name: lastName,
                 mobile_phone: mobilePhone,
-                product: mode === "retail" ? "Home Loan" : "Personal Loan for Salaried Customers",
+                product,
                 product_category: "Loans",
                 lead_owner_name: "Mr. James May",
                 rating: "Warm"

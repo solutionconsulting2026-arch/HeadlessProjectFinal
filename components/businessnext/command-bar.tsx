@@ -79,7 +79,13 @@ export default function CommandBar({
           className="w-full resize-none border-none bg-transparent py-1 px-2 text-sm text-gray-800 placeholder-gray-400 focus:outline-none focus:ring-0 disabled:opacity-50"
         />
 
-        <div className="flex items-center space-x-2 shrink-0 pr-1">
+        <div className="flex items-center space-x-3 shrink-0 pr-1">
+          {loading && loadingStage && (
+            <span className="hidden sm:flex items-center gap-1.5 text-[11px] font-semibold text-[#E71A73] animate-pulse">
+              <RefreshCw size={11} className="animate-spin" />
+              {loadingStage}
+            </span>
+          )}
           {loading ? (
             <button
               onClick={onStop}
