@@ -1,20 +1,55 @@
 "use client";
 
 import React, { useState, useMemo } from "react";
-import { 
-  CheckCircle2, 
-  AlertTriangle, 
-  XCircle, 
-  Clock, 
-  HelpCircle, 
+import {
+  CheckCircle2,
+  AlertTriangle,
+  XCircle,
+  Clock,
+  HelpCircle,
   ArrowUpDown,
   Search,
   ChevronLeft,
   ChevronRight,
   TrendingUp,
-  UserCheck
+  UserCheck,
+  Sparkles
 } from "lucide-react";
+import {
+  ResponsiveContainer,
+  BarChart,
+  Bar,
+  LineChart,
+  Line,
+  AreaChart,
+  Area,
+  PieChart,
+  Pie,
+  Cell,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  Legend
+} from "recharts";
 import { UIComponent, SuggestedAction } from "@/lib/ai/ui-schema";
+
+const CHART_COLORS = ["#E71A73", "#2E7D32", "#F59E0B", "#3B82F6", "#8B5CF6", "#EF4444", "#14B8A6"];
+
+// Normalizes several shapes the LLM might send (array of {key,value}, plain object, or
+// already-chart-shaped rows) into recharts-friendly rows: [{ name, value }, ...]
+function normalizeChartData(data: any): { name: string; value: number }[] {
+  if (Array.isArray(data)) {
+    return data.map((d: any) => ({
+      name: String(d.name ?? d.label ?? d.key ?? ""),
+      value: Number(d.value ?? d.count ?? 0)
+    }));
+  }
+  if (data && typeof data === "object") {
+    return Object.entries(data).map(([name, value]) => ({ name, value: Number(value) }));
+  }
+  return [];
+}
 
 interface RendererProps {
   components: UIComponent[];
@@ -59,15 +94,19 @@ export default function ComponentRenderer({
       {/* Dynamic Component Loop */}
       {components.map((comp, index) => {
         // Determine if component spans full width (2 columns) or fits side-by-side (1 column)
-        const isFullWidth = 
-          comp.type === "page_header" || 
-          comp.type === "metric_group" || 
-          comp.type === "alert" || 
-          comp.type === "confirmation" || 
+        const isFullWidth =
+          comp.type === "page_header" ||
+          comp.type === "metric_group" ||
+          comp.type === "alert" ||
+          comp.type === "confirmation" ||
           comp.type === "empty_state" ||
           comp.type === "error" ||
           comp.type === "pipeline" ||
-          comp.props?.colSpan === 2 || 
+          comp.type === "data_table" ||
+          comp.type === "timeline" ||
+          comp.type === "activity_list" ||
+          comp.type === "markdown" ||
+          comp.props?.colSpan === 2 ||
           comp.props?.colSpan === "full";
 
         return (
@@ -257,17 +296,241 @@ function RenderSingleComponent({
       );
 
     case "insight_card":
+    case "recommendation_card":
       return (
         <div className="rounded-lg border border-pink-100 bg-pink-50/30 p-5 shadow-sm border-l-4 border-l-[#E71A73] space-y-2">
           <h4 className="font-bold text-[#E71A73] text-sm tracking-wider uppercase font-poppins flex items-center">
-            <TrendingUp className="mr-2 h-4 w-4" />
-            {title || "AI Insight"}
+            {type === "recommendation_card" ? (
+              <Sparkles className="mr-2 h-4 w-4" />
+            ) : (
+              <TrendingUp className="mr-2 h-4 w-4" />
+            )}
+            {title || (type === "recommendation_card" ? "Recommended Action" : "AI Insight")}
           </h4>
           <p className="text-xs text-gray-700 leading-relaxed whitespace-pre-line">
-            {data?.insight || data || ""}
+            {data?.insight || data?.text || (typeof data === "string" ? data : "") || ""}
           </p>
+          {data?.actionLabel && (
+            <button
+              onClick={() => onActionClick(data.actionIntent || data.actionLabel)}
+              className="mt-1 rounded-md border border-[#E71A73] bg-white px-3 py-1.5 text-xs font-bold text-[#E71A73] hover:bg-pink-50 transition-colors"
+            >
+              {data.actionLabel}
+            </button>
+          )}
         </div>
       );
+
+    // Domain-specific detail cards all share the same key/value card shell as account_summary.
+    case "customer_summary":
+    case "customer_360":
+    case "lead_summary":
+    case "service_request_summary":
+      return (
+        <div className="rounded-2xl border border-gray-200 bg-white shadow-sm overflow-hidden h-full">
+          {title && (
+            <div className="border-b border-gray-100 bg-white px-5 py-4 font-extrabold text-gray-800 text-xs tracking-wider uppercase font-poppins">
+              {title}
+            </div>
+          )}
+          <div className="p-5 space-y-3.5">
+            {Object.entries(data || {}).map(([key, value]: any) => (
+              <div key={key} className="flex justify-between py-1.5 border-b border-gray-50 last:border-none text-xs font-poppins font-medium">
+                <span className="text-[#757575] font-bold flex items-center capitalize">{key.replace(/_/g, " ")}</span>
+                <span className="text-gray-800 font-extrabold text-right truncate max-w-[200px]" title={String(value)}>
+                  {String(value)}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+
+    case "metric":
+      return (
+        <div className="rounded-2xl border border-gray-100 bg-white px-5 py-4 text-left shadow-sm h-full flex flex-col justify-center">
+          <div className="text-[10px] font-extrabold uppercase tracking-wider text-[#757575] font-poppins truncate">
+            {title || data?.label || "Metric"}
+          </div>
+          <div className="text-2xl font-black text-gray-800 font-poppins mt-1">
+            {data?.value ?? data ?? "—"}
+          </div>
+          {data?.trend && (
+            <div className={`text-xs font-bold mt-1 ${data.trend.startsWith("-") ? "text-red-500" : "text-green-600"}`}>
+              {data.trend}
+            </div>
+          )}
+        </div>
+      );
+
+    case "status_badge":
+      const badgeTone = props.tone || data?.tone || "neutral";
+      const toneClasses: Record<string, string> = {
+        success: "bg-[#EAF8EB] text-[#2E7D32]",
+        warning: "bg-[#FFF3E0] text-[#EF6C00]",
+        error: "bg-red-50 text-red-600",
+        neutral: "bg-gray-100 text-gray-600"
+      };
+      return (
+        <div className="rounded-lg border border-gray-100 bg-white p-4 shadow-sm h-full flex items-center justify-between">
+          {title && <span className="text-xs font-bold text-gray-500 uppercase tracking-wider font-poppins">{title}</span>}
+          <span className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-extrabold ${toneClasses[badgeTone] || toneClasses.neutral}`}>
+            {data?.label || data?.status || (typeof data === "string" ? data : "N/A")}
+          </span>
+        </div>
+      );
+
+    case "progress":
+      const progressItems = Array.isArray(data) ? data : [data];
+      return (
+        <div className="rounded-lg border border-gray-100 bg-white p-5 shadow-sm space-y-4 h-full">
+          {title && <h3 className="font-bold text-gray-800 text-sm font-poppins">{title}</h3>}
+          {progressItems.map((item: any, idx: number) => {
+            const max = item?.max || 100;
+            const value = Math.min(item?.value || 0, max);
+            const pct = (value / max) * 100;
+            return (
+              <div key={idx} className="space-y-1.5">
+                <div className="flex justify-between text-xs font-semibold text-gray-600">
+                  <span>{item?.label || "Progress"}</span>
+                  <span>{Math.round(pct)}%</span>
+                </div>
+                <div className="h-2.5 w-full bg-gray-100 rounded-full overflow-hidden">
+                  <div
+                    style={{ width: `${pct}%` }}
+                    className="h-full bg-gradient-to-r from-pink-400 to-[#E71A73] rounded-full transition-all duration-500"
+                  />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      );
+
+    case "timeline":
+    case "activity_list":
+      const events = Array.isArray(data) ? data : [];
+      return (
+        <div className="rounded-lg border border-gray-100 bg-white p-5 shadow-sm">
+          {title && <h3 className="font-bold text-gray-800 text-sm font-poppins mb-4">{title}</h3>}
+          <div className="space-y-0">
+            {events.map((ev: any, idx: number) => (
+              <div key={idx} className="flex gap-3 pb-5 last:pb-0 relative">
+                {idx !== events.length - 1 && (
+                  <div className="absolute left-[5px] top-3 bottom-0 w-px bg-gray-200" />
+                )}
+                <div className="mt-1.5 h-2.5 w-2.5 rounded-full bg-[#E71A73] shrink-0 z-10" />
+                <div className="flex-1 pb-1">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-extrabold text-gray-800 font-poppins">{ev.title || ev.label || ev.event}</span>
+                    {(ev.date || ev.timestamp) && (
+                      <span className="text-[10px] text-gray-400 font-semibold">{ev.date || ev.timestamp}</span>
+                    )}
+                  </div>
+                  {(ev.description || ev.subtitle) && (
+                    <p className="text-xs text-gray-500 mt-0.5">{ev.description || ev.subtitle}</p>
+                  )}
+                </div>
+              </div>
+            ))}
+            {events.length === 0 && <p className="text-xs text-gray-400">No activity recorded.</p>}
+          </div>
+        </div>
+      );
+
+    case "markdown":
+      // AI-generated prose is rendered as escaped plain text (React escapes by default);
+      // we never use dangerouslySetInnerHTML here so no HTML/script from the LLM can execute.
+      const mdText = typeof data === "string" ? data : data?.text || "";
+      return (
+        <div className="rounded-lg border border-gray-100 bg-white p-5 shadow-sm text-sm text-gray-700 leading-relaxed">
+          {title && <h3 className="font-bold text-gray-800 text-sm font-poppins mb-2">{title}</h3>}
+          {mdText.split("\n").map((line: string, idx: number) => (
+            <p key={idx} className="whitespace-pre-wrap mb-1.5 last:mb-0">
+              {line.split(/(\*\*[^*]+\*\*)/g).map((chunk, cIdx) =>
+                chunk.startsWith("**") && chunk.endsWith("**") ? (
+                  <strong key={cIdx}>{chunk.slice(2, -2)}</strong>
+                ) : (
+                  <React.Fragment key={cIdx}>{chunk}</React.Fragment>
+                )
+              )}
+            </p>
+          ))}
+        </div>
+      );
+
+    case "success":
+      return (
+        <div className="rounded-lg border border-green-200 bg-green-50 p-4 flex items-start space-x-3 text-sm text-green-800">
+          <CheckCircle2 size={18} className="shrink-0 text-green-500 mt-0.5" />
+          <div>
+            <div className="font-bold">{title || "Success"}</div>
+            <p className="mt-0.5 leading-relaxed text-xs">{data?.message || data || ""}</p>
+          </div>
+        </div>
+      );
+
+    case "bar_chart":
+    case "line_chart":
+    case "area_chart": {
+      const chartRows = normalizeChartData(data);
+      return (
+        <div className="rounded-lg border border-gray-100 bg-white p-5 shadow-sm h-full">
+          {title && <h3 className="font-bold text-gray-800 text-sm font-poppins mb-4">{title}</h3>}
+          <div style={{ width: "100%", height: 240 }}>
+            <ResponsiveContainer>
+              {type === "bar_chart" ? (
+                <BarChart data={chartRows} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#F0F0F0" />
+                  <XAxis dataKey="name" tick={{ fontSize: 11 }} />
+                  <YAxis tick={{ fontSize: 11 }} />
+                  <Tooltip />
+                  <Bar dataKey="value" fill="#E71A73" radius={[4, 4, 0, 0]} />
+                </BarChart>
+              ) : type === "line_chart" ? (
+                <LineChart data={chartRows} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#F0F0F0" />
+                  <XAxis dataKey="name" tick={{ fontSize: 11 }} />
+                  <YAxis tick={{ fontSize: 11 }} />
+                  <Tooltip />
+                  <Line type="monotone" dataKey="value" stroke="#E71A73" strokeWidth={2.5} dot={{ r: 3 }} />
+                </LineChart>
+              ) : (
+                <AreaChart data={chartRows} margin={{ top: 5, right: 10, left: -20, bottom: 0 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="#F0F0F0" />
+                  <XAxis dataKey="name" tick={{ fontSize: 11 }} />
+                  <YAxis tick={{ fontSize: 11 }} />
+                  <Tooltip />
+                  <Area type="monotone" dataKey="value" stroke="#E71A73" fill="#FCE4EC" strokeWidth={2.5} />
+                </AreaChart>
+              )}
+            </ResponsiveContainer>
+          </div>
+        </div>
+      );
+    }
+
+    case "donut_chart": {
+      const donutRows = normalizeChartData(data);
+      return (
+        <div className="rounded-lg border border-gray-100 bg-white p-5 shadow-sm h-full">
+          {title && <h3 className="font-bold text-gray-800 text-sm font-poppins mb-4">{title}</h3>}
+          <div style={{ width: "100%", height: 240 }}>
+            <ResponsiveContainer>
+              <PieChart>
+                <Pie data={donutRows} dataKey="value" nameKey="name" innerRadius={55} outerRadius={85} paddingAngle={2}>
+                  {donutRows.map((_, idx) => (
+                    <Cell key={idx} fill={CHART_COLORS[idx % CHART_COLORS.length]} />
+                  ))}
+                </Pie>
+                <Tooltip />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+              </PieChart>
+            </ResponsiveContainer>
+          </div>
+        </div>
+      );
+    }
 
     case "alert":
       const isWarn = props.type === "warning" || data?.status === "warning";
