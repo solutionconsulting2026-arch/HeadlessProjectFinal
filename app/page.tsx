@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import Shell from "@/components/businessnext/shell";
 import CommandBar from "@/components/businessnext/command-bar";
 import Canvas from "@/components/businessnext/canvas";
@@ -22,14 +22,18 @@ export default function WorkspaceHome() {
   
   // Conversational context state
   const [chatHistory, setChatHistory] = useState<{ role: "user" | "assistant"; content: string }[]>([]);
-  
+
   // Slide-out Lead Details Drawer state
   const [activeDrawerLeadId, setActiveDrawerLeadId] = useState<string | null>(null);
 
   const [loading, setLoading] = useState(false);
   const [loadingStage, setLoadingStage] = useState("");
-  const [response, setResponse] = useState<AIWorkspaceResponse | null>(null);
-  
+
+  // Chat-style feed: every turn stays on screen (appended below the previous one)
+  // instead of a single response replacing the last one.
+  const [turns, setTurns] = useState<{ id: string; query: string; response: AIWorkspaceResponse }[]>([]);
+  const feedEndRef = useRef<HTMLDivElement>(null);
+
   // Confirmed Write action states
   const [actionPending, setActionPending] = useState(false);
   const [actionResult, setActionResult] = useState<any>(null);
@@ -46,6 +50,11 @@ export default function WorkspaceHome() {
       }
     }
   }, []);
+
+  // Keep the newest turn (or the loading indicator) in view as the feed grows
+  useEffect(() => {
+    feedEndRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [turns.length, loading]);
 
   // Global window binding for opening the slide-over lead drawer
   useEffect(() => {
@@ -89,7 +98,6 @@ export default function WorkspaceHome() {
     setLoading(true);
     setActionResult(null);
     setActionError(null);
-    setResponse(null);
 
     // Sequence loading stages to show real activity progress
     const stages = [
@@ -122,8 +130,10 @@ export default function WorkspaceHome() {
       const data = await res.json();
       clearInterval(stageInterval);
 
-      setResponse(data);
-      
+      // Append as a new turn rather than replacing the previous one, so prior
+      // Customer 360 / lookup cards stay visible in the feed like a chat thread.
+      setTurns(prev => [...prev, { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, query, response: data }]);
+
       // Save query/response to thread context
       setChatHistory(prev => [
         ...prev,
@@ -174,7 +184,7 @@ export default function WorkspaceHome() {
   };
 
   const handleNewConversation = () => {
-    setResponse(null);
+    setTurns([]);
     setActionResult(null);
     setActionError(null);
     setChatHistory([]);
@@ -192,7 +202,7 @@ export default function WorkspaceHome() {
   const handleLogout = () => {
     setSession(null);
     localStorage.removeItem("crm_session");
-    setResponse(null);
+    setTurns([]);
     setActionResult(null);
     setActionError(null);
     setChatHistory([]);
@@ -214,29 +224,11 @@ export default function WorkspaceHome() {
       workspaceMode={session.mode}
       onLogout={handleLogout}
     >
-      <div className="flex-1 flex flex-col items-center justify-between min-h-0">
-        
-        {/* Main content viewport - overflow-visible ensures no nested scroll clipping */}
-        <div className="w-full flex-1 flex flex-col mb-6">
-          {loading ? (
-            /* Premium loading screen layout */
-            <LoadingScreen stage={loadingStage} />
-          ) : response ? (
-            /* Dynamic Result Canvas View */
-            <Canvas
-              title={response.title}
-              subtitle={response.subtitle}
-              message={response.message}
-              layout={response.layout}
-              components={response.components}
-              suggestedActions={response.suggestedActions}
-              onActionClick={handleSendQuery}
-              onExecuteWrite={handleExecuteWrite}
-              actionPending={actionPending}
-              actionResult={actionResult}
-              actionError={actionError}
-            />
-          ) : (
+      <div className="w-full h-full flex flex-col min-h-0">
+
+        {/* Scrollable chat feed — this div owns scrolling so the command bar below can stay pinned */}
+        <div className="w-full flex-1 overflow-y-auto min-h-0 flex flex-col mb-4">
+          {turns.length === 0 && !loading ? (
             /* Landing Screen Card Grid */
             <div className="w-full max-w-4xl mx-auto space-y-10 py-8 flex-1 flex flex-col justify-center">
               <div className="text-center space-y-3">
@@ -321,6 +313,48 @@ export default function WorkspaceHome() {
                   </div>
                 </button>
               </div>
+            </div>
+          ) : (
+            /* Chat-style feed: every past turn stays rendered, newest at the bottom */
+            <div className="w-full max-w-5xl mx-auto flex flex-col gap-8 py-2">
+              {turns.map((turn) => (
+                <div key={turn.id} className="flex flex-col gap-4">
+                  <div className="flex justify-end">
+                    <div className="max-w-xl rounded-2xl rounded-tr-sm bg-[#E71A73] px-4 py-2.5 text-sm font-semibold text-white shadow-sm">
+                      {turn.query}
+                    </div>
+                  </div>
+                  <Canvas
+                    title={turn.response.title}
+                    subtitle={turn.response.subtitle}
+                    message={turn.response.message}
+                    layout={turn.response.layout}
+                    components={turn.response.components}
+                    suggestedActions={turn.response.suggestedActions}
+                    onActionClick={handleSendQuery}
+                    onExecuteWrite={handleExecuteWrite}
+                    actionPending={actionPending}
+                    actionResult={actionResult}
+                    actionError={actionError}
+                  />
+                </div>
+              ))}
+
+              {loading && (
+                turns.length === 0 ? (
+                  /* First query in the conversation: full premium loading layout */
+                  <LoadingScreen stage={loadingStage} />
+                ) : (
+                  /* Follow-up query: a small inline indicator appended below existing turns,
+                     so earlier Customer 360 / lookup cards never disappear while it loads. */
+                  <div className="flex items-center gap-3 rounded-xl border border-[#E5E7EB] bg-white px-5 py-4 shadow-sm self-start">
+                    <span className="h-2 w-2 rounded-full bg-[#E71A73] animate-pulse" />
+                    <span className="text-xs font-semibold text-[#757575]">{loadingStage || "Thinking..."}</span>
+                  </div>
+                )
+              )}
+
+              <div ref={feedEndRef} />
             </div>
           )}
         </div>

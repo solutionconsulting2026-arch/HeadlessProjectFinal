@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React from "react";
 import Link from "next/link";
 import { 
   Home, 
@@ -44,8 +44,6 @@ export default function Shell({
   workspaceMode,
   onLogout
 }: ShellProps) {
-  const [collapsed, setCollapsed] = useState(false);
-
   const navItems = [
     { id: "home", label: "Home", icon: Home },
     { id: "customers", label: "Customers", icon: Users },
@@ -63,13 +61,7 @@ export default function Shell({
       <header className="flex h-14 items-center justify-between bg-[#0B0F19] border-b border-[#1E293B]/60 px-6 shrink-0 text-white select-none z-10 font-poppins">
         {/* Left Side: Brand Logo & Hamburger */}
         <div className="flex items-center space-x-4">
-          <button 
-            type="button"
-            onClick={() => setCollapsed(!collapsed)}
-            className="text-gray-400 hover:text-white transition-colors"
-          >
-            <Menu size={20} />
-          </button>
+          <Menu size={20} className="text-gray-400" />
           <img src="/logo-white.png" alt="BUSINESSNEXT Logo" className="h-6 w-auto object-contain" />
         </div>
 
@@ -138,14 +130,9 @@ export default function Shell({
       {/* 2. BODY SPLIT CONTAINER BELOW HEADER */}
       <div className="flex flex-1 overflow-hidden min-h-0">
         
-        {/* Collapsible Left Sidebar */}
-        <aside 
-          className={`relative flex flex-col border-r border-[#E5E7EB] bg-white transition-all duration-300 ${
-            collapsed ? "w-16" : "w-56"
-          }`}
-        >
-          {/* Sidebar Nav links (Removed Recent Conversations completely) */}
-          <nav className="flex-1 space-y-1 px-3 py-6 overflow-y-auto">
+        {/* Thin icon-only Left Sidebar (no text labels, fixed width) */}
+        <aside className="relative flex flex-col w-16 border-r border-[#E5E7EB] bg-white">
+          <nav className="flex-1 space-y-1 px-2.5 py-6 overflow-y-auto">
             {navItems.map((item) => {
               const Icon = item.icon;
               const isActive = activeTab === item.id;
@@ -153,33 +140,35 @@ export default function Shell({
                 <button
                   key={item.id}
                   onClick={() => setActiveTab(item.id)}
-                  className={`flex w-full items-center rounded-lg px-3 py-2.5 text-sm font-semibold transition-colors ${
-                    isActive 
-                      ? "bg-pink-50 text-[#E71A73]" 
+                  title={item.label}
+                  aria-label={item.label}
+                  className={`flex w-full items-center justify-center rounded-lg py-2.5 transition-colors ${
+                    isActive
+                      ? "bg-pink-50 text-[#E71A73]"
                       : "text-[#595959] hover:bg-gray-50 hover:text-[#333333]"
                   }`}
                 >
                   <Icon className={`h-5 w-5 shrink-0 ${isActive ? "text-[#E71A73]" : "text-gray-400"}`} />
-                  {!collapsed && <span className="ml-3 truncate">{item.label}</span>}
                 </button>
               );
             })}
           </nav>
 
           {/* Bottom Settings Link */}
-          <div className="border-t border-[#E5E7EB] p-3">
+          <div className="border-t border-[#E5E7EB] p-2.5">
             <Link
               href="/admin/integrations"
-              className="flex w-full items-center rounded-lg px-3 py-2 text-sm font-semibold text-[#595959] hover:bg-gray-50 hover:text-[#333333] transition-colors"
+              title="Administration"
+              aria-label="Administration"
+              className="flex w-full items-center justify-center rounded-lg py-2 text-[#595959] hover:bg-gray-50 hover:text-[#333333] transition-colors"
             >
               <Settings className="h-5 w-5 text-gray-400 shrink-0" />
-              {!collapsed && <span className="ml-3 truncate">Administration</span>}
             </Link>
           </div>
         </aside>
 
-        {/* Outer Workspace Content Canvas */}
-        <main className="flex-1 overflow-y-auto p-8 relative flex flex-col min-h-0 bg-[#F7F8FA]">
+        {/* Outer Workspace Content Canvas — scrolling is owned by the chat feed inside children */}
+        <main className="flex-1 overflow-hidden p-8 relative flex flex-col min-h-0 bg-[#F7F8FA]">
           {children}
         </main>
 
