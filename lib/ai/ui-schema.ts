@@ -1,7 +1,9 @@
 import { z } from "zod";
 
-// Definition of all possible UI component types
-export const UIComponentTypeEnum = z.enum([
+// Definition of all possible UI component types. Kept as a plain array (rather than
+// inline in z.enum) so other callers — e.g. the Anthropic tool schema in orchestrator.ts —
+// can reuse the exact same list instead of maintaining a second copy that could drift.
+export const UI_COMPONENT_TYPES = [
   "page_header",
   "metric",
   "metric_group",
@@ -31,7 +33,9 @@ export const UIComponentTypeEnum = z.enum([
   "error",
   "empty_state",
   "markdown",
-]);
+] as const;
+
+export const UIComponentTypeEnum = z.enum(UI_COMPONENT_TYPES);
 
 export const UIComponentSchema = z.object({
   type: UIComponentTypeEnum,

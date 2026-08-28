@@ -1,21 +1,129 @@
 import OpenAI from "openai";
-import { McpClient, mcpDiagnostics } from "../mcp/client";
+import Anthropic from "@anthropic-ai/sdk";
+import { McpClient, McpTool, mcpDiagnostics } from "../mcp/client";
 import { CRM_AGENT_SYSTEM_PROMPT_CORPORATE, CRM_AGENT_SYSTEM_PROMPT_RETAIL } from "./prompts";
-import { AIWorkspaceResponse, AIWorkspaceResponseSchema } from "./ui-schema";
+import { AIWorkspaceResponse, AIWorkspaceResponseSchema, UI_COMPONENT_TYPES } from "./ui-schema";
 import { auditLogger } from "../security/audit";
+
+// MCP tools whose results represent a single CRM entity (customer/account/lead) worth
+// remembering for the rest of the conversation, so follow-up questions don't need to
+// re-hit the MCP server for data we already have.
+const FETCH_TOOL_NAMES = new Set(["get_account", "get_retail_account", "get_retail_lead"]);
+
+interface CachedEntity {
+  toolName: string;
+  args: Record<string, any>;
+  rawResult: any;
+  fetchedAt: number;
+}
+
+// Anthropic tool definition used to force Claude to hand back a structured
+// AIWorkspaceResponse instead of free-form text (Claude has no "json_object" response
+// mode like OpenAI, so a forced tool call is the reliable way to get validated JSON out).
+const RENDER_UI_TOOL: Anthropic.Tool = {
+  name: "render_workspace_ui",
+  description:
+    "Render the final BUSINESSNEXT workspace UI for this turn. Call this exactly once, after any needed CRM data has been gathered, with your freshly-designed component layout.",
+  input_schema: {
+    type: "object",
+    properties: {
+      title: { type: "string" },
+      subtitle: { type: "string" },
+      message: { type: "string", description: "Conversational summary shown above the rendered components." },
+      layout: {
+        type: "object",
+        properties: {
+          type: { type: "string", enum: ["dashboard", "detail", "list", "workspace"] },
+          columns: { type: "number" },
+        },
+      },
+      components: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            type: { type: "string", enum: [...UI_COMPONENT_TYPES] },
+            title: { type: "string" },
+            subtitle: { type: "string" },
+            data: {},
+            props: { type: "object" },
+          },
+          required: ["type"],
+        },
+      },
+      suggestedActions: {
+        type: "array",
+        items: {
+          type: "object",
+          properties: {
+            id: { type: "string" },
+            label: { type: "string" },
+            intent: { type: "string" },
+            requiresConfirmation: { type: "boolean" },
+            actionCategory: { type: "string", enum: ["READ", "WRITE", "DESTRUCTIVE"] },
+            payload: { type: "object" },
+          },
+          required: ["id", "label", "intent"],
+        },
+      },
+    },
+    required: ["components"],
+  },
+};
 
 export class AIOrchestrator {
   private openai: OpenAI | null = null;
+  private anthropic: Anthropic | null = null;
   private mcpClient: McpClient;
+
+  // In-memory, per-conversation cache of raw CRM entity fetches. Lives for the lifetime
+  // of this server instance (same pattern as auditLogger / mcpDiagnostics elsewhere in
+  // this codebase) so a follow-up turn can reuse already-fetched data instead of calling
+  // the MCP server again.
+  private entityCache: Map<string, CachedEntity[]> = new Map();
 
   constructor() {
     this.mcpClient = new McpClient();
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (apiKey) {
-      this.openai = new OpenAI({ apiKey });
-    } else {
-      console.warn("[ORCHESTRATOR] OPENAI_API_KEY is not defined. Falling back to local semantic parser.");
+
+    const anthropicKey = process.env.ANTHROPIC_API_KEY;
+    if (anthropicKey) {
+      this.anthropic = new Anthropic({ apiKey: anthropicKey });
     }
+
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (openaiKey) {
+      this.openai = new OpenAI({ apiKey: openaiKey });
+    }
+
+    if (!this.anthropic && !this.openai) {
+      console.warn("[ORCHESTRATOR] No ANTHROPIC_API_KEY or OPENAI_API_KEY defined. Falling back to local semantic parser.");
+    }
+  }
+
+  private cacheEntity(conversationId: string, toolName: string, args: Record<string, any>, rawResult: any) {
+    if (!FETCH_TOOL_NAMES.has(toolName)) return;
+    const list = this.entityCache.get(conversationId) || [];
+    const key = `${toolName}:${JSON.stringify(args)}`;
+    const withoutStale = list.filter((e) => `${e.toolName}:${JSON.stringify(e.args)}` !== key);
+    withoutStale.push({ toolName, args, rawResult, fetchedAt: Date.now() });
+    // Cap history so the context block doesn't grow unbounded over a long conversation.
+    this.entityCache.set(conversationId, withoutStale.slice(-5));
+  }
+
+  private getCachedContextBlock(conversationId: string): string {
+    const list = this.entityCache.get(conversationId);
+    if (!list || list.length === 0) return "";
+    const serialized = list.map((e) => ({ tool: e.toolName, arguments: e.args, data: e.rawResult }));
+    return `\n\n### CACHED CRM CONTEXT (already fetched this conversation)\n${JSON.stringify(serialized)}`;
+  }
+
+  private filterCrmTools(mcpTools: McpTool[], mode: "corporate" | "retail"): McpTool[] {
+    return mcpTools.filter((t) => {
+      if (mode === "retail") {
+        return t.name === "get_retail_account" || t.name === "get_retail_lead" || t.name === "create_lead" || t.name === "test_connection";
+      }
+      return t.name === "get_account" || t.name === "create_lead" || t.name === "test_connection";
+    });
   }
 
   public async processMessage(
@@ -25,149 +133,22 @@ export class AIOrchestrator {
     history: any[] = []
   ): Promise<AIWorkspaceResponse> {
     const startTime = Date.now();
-    const model = process.env.OPENAI_MODEL || "gpt-5.6-terra";
-    const toolsUsed: string[] = [];
+    const basePrompt = mode === "retail" ? CRM_AGENT_SYSTEM_PROMPT_RETAIL : CRM_AGENT_SYSTEM_PROMPT_CORPORATE;
+    const systemPrompt = basePrompt + this.getCachedContextBlock(conversationId);
 
     console.log(`[ORCHESTRATOR] Mode: ${mode} | History Turns: ${history.length} | Message: "${userMessage}"`);
 
-    // Try calling OpenAI Responses API if key is present
+    if (this.anthropic) {
+      try {
+        return await this.processWithAnthropic(userMessage, conversationId, mode, history, systemPrompt, startTime);
+      } catch (err: any) {
+        console.error("[ORCHESTRATOR] Anthropic agent loop failed, falling back.", err.message);
+      }
+    }
+
     if (this.openai) {
       try {
-        // 1. Discover tools from MCP server
-        const mcpTools = await this.mcpClient.listTools();
-        
-        // 2. Filter tools based on active workspace mode
-        const filteredMcpTools = mcpTools.filter(t => {
-          if (mode === "retail") {
-            return t.name === "get_retail_account" || t.name === "get_retail_lead" || t.name === "create_lead" || t.name === "test_connection";
-          } else {
-            return t.name === "get_account" || t.name === "create_lead" || t.name === "test_connection";
-          }
-        });
-
-        const openaiTools = filteredMcpTools.map(t => ({
-          type: "function" as const,
-          function: {
-            name: t.name,
-            description: t.description || "",
-            parameters: {
-              type: t.inputSchema.type,
-              properties: t.inputSchema.properties,
-              required: t.inputSchema.required
-            }
-          }
-        }));
-
-        const systemPrompt = mode === "retail" ? CRM_AGENT_SYSTEM_PROMPT_RETAIL : CRM_AGENT_SYSTEM_PROMPT_CORPORATE;
-
-        const messages: any[] = [
-          { role: "system", content: systemPrompt }
-        ];
-
-        // 3. Append history logs
-        if (Array.isArray(history)) {
-          for (const msg of history) {
-            messages.push({
-              role: msg.role === "assistant" ? "assistant" : "user",
-              content: msg.content
-            });
-          }
-        }
-
-        // Append current query
-        messages.push({ role: "user", content: userMessage });
-
-        // 4. First completion pass (with tool definitions)
-        const response = await this.openai.chat.completions.create({
-          model: model.includes("gpt-5.6") ? "gpt-4o" : model,
-          messages,
-          tools: openaiTools.length > 0 ? openaiTools : undefined,
-          temperature: 0.2
-        });
-
-        const choice = response.choices[0];
-        const messageResponse = choice?.message;
-
-        // 5. Check for tool executions requested by the AI
-        if (messageResponse?.tool_calls && messageResponse.tool_calls.length > 0) {
-          console.log(`[ORCHESTRATOR] OpenAI requested ${messageResponse.tool_calls.length} tool call(s).`);
-          messages.push(messageResponse);
-
-          for (const toolCall of (messageResponse.tool_calls as any[])) {
-            const toolName = toolCall.function.name;
-            const toolArgs = JSON.parse(toolCall.function.arguments || "{}");
-            console.log(`[ORCHESTRATOR] Executing tool ${toolName} in real-time...`, toolArgs);
-            
-            const toolStart = Date.now();
-            toolsUsed.push(toolName);
-            let resultText = "";
-
-            try {
-              const result = await this.mcpClient.callTool(toolName, toolArgs);
-              resultText = JSON.stringify(result);
-
-              auditLogger.log({
-                conversationId,
-                userId: "admin-dev",
-                toolName,
-                actionCategory: toolName === "create_lead" ? "WRITE" : "READ",
-                status: "success",
-                durationMs: Date.now() - toolStart
-              });
-            } catch (err: any) {
-              console.error(`[ORCHESTRATOR] Real-time tool execution error: ${toolName}`, err.message);
-              resultText = JSON.stringify({ error: err.message, status: "error" });
-
-              auditLogger.log({
-                conversationId,
-                userId: "admin-dev",
-                toolName,
-                actionCategory: toolName === "create_lead" ? "WRITE" : "READ",
-                status: "error",
-                durationMs: Date.now() - toolStart,
-                message: err.message
-              });
-            }
-
-            messages.push({
-              role: "tool",
-              tool_call_id: toolCall.id,
-              content: resultText
-            });
-          }
-
-          // 6. Second completion pass (returns structured UI schema based on tool results)
-          console.log("[ORCHESTRATOR] Calling OpenAI second completion pass...");
-          const secondResponse = await this.openai.chat.completions.create({
-            model: model.includes("gpt-5.6") ? "gpt-4o" : model,
-            messages,
-            temperature: 0.2,
-            response_format: { type: "json_object" }
-          });
-
-          const content = secondResponse.choices[0]?.message?.content || "";
-          const parsed = JSON.parse(content);
-          const validated = AIWorkspaceResponseSchema.parse(parsed);
-
-          validated.metadata = {
-            toolsUsed,
-            executionTime: Date.now() - startTime
-          };
-
-          return validated;
-        }
-
-        // Handle direct text/JSON response if no tools were called (e.g. conversational follow-ups)
-        const content = messageResponse?.content || "";
-        const parsed = JSON.parse(content);
-        const validated = AIWorkspaceResponseSchema.parse(parsed);
-        
-        validated.metadata = {
-          toolsUsed: [],
-          executionTime: Date.now() - startTime,
-        };
-
-        return validated;
+        return await this.processWithOpenAI(userMessage, conversationId, mode, history, systemPrompt, startTime);
       } catch (err: any) {
         console.error("[ORCHESTRATOR] OpenAI agent loop failed, falling back to semantic parser.", err.message);
       }
@@ -175,6 +156,271 @@ export class AIOrchestrator {
 
     // Local Semantic Parser Fallback (interacts with the LIVE MCP server)
     return this.fallbackSemanticRouting(userMessage, conversationId, startTime, mode, history);
+  }
+
+  private async processWithAnthropic(
+    userMessage: string,
+    conversationId: string,
+    mode: "corporate" | "retail",
+    history: any[],
+    systemPrompt: string,
+    startTime: number
+  ): Promise<AIWorkspaceResponse> {
+    const anthropic = this.anthropic!;
+    const model = process.env.ANTHROPIC_MODEL || "claude-sonnet-5";
+    const toolsUsed: string[] = [];
+
+    const mcpTools = await this.mcpClient.listTools();
+    const crmTools = this.filterCrmTools(mcpTools, mode).map((t) => ({
+      name: t.name,
+      description: t.description || "",
+      input_schema: {
+        type: "object" as const,
+        properties: t.inputSchema.properties,
+        required: t.inputSchema.required,
+      },
+    }));
+
+    const messages: Anthropic.MessageParam[] = [];
+    if (Array.isArray(history)) {
+      for (const msg of history) {
+        messages.push({
+          role: msg.role === "assistant" ? "assistant" : "user",
+          content: String(msg.content ?? ""),
+        });
+      }
+    }
+    messages.push({ role: "user", content: userMessage });
+
+    // Pass 1: let Claude decide whether it needs to call a CRM tool, or already has
+    // enough (from the cached context / conversation) to answer directly.
+    const pass1 = await anthropic.messages.create({
+      model,
+      system: systemPrompt,
+      max_tokens: 1024,
+      temperature: 0.2,
+      messages,
+      tools: crmTools.length > 0 ? crmTools : undefined,
+    });
+
+    messages.push({ role: "assistant", content: pass1.content });
+
+    const toolUseBlocks = pass1.content.filter((b): b is Anthropic.ToolUseBlock => b.type === "tool_use");
+    if (toolUseBlocks.length > 0) {
+      const toolResultBlocks: Anthropic.ToolResultBlockParam[] = [];
+
+      for (const block of toolUseBlocks) {
+        const toolName = block.name;
+        const toolArgs = (block.input || {}) as Record<string, any>;
+        console.log(`[ORCHESTRATOR] Claude requested tool ${toolName}`, toolArgs);
+
+        const toolStart = Date.now();
+        toolsUsed.push(toolName);
+
+        try {
+          const result = await this.mcpClient.callTool(toolName, toolArgs);
+          this.cacheEntity(conversationId, toolName, toolArgs, result);
+
+          auditLogger.log({
+            conversationId,
+            userId: "admin-dev",
+            toolName,
+            actionCategory: toolName === "create_lead" ? "WRITE" : "READ",
+            status: "success",
+            durationMs: Date.now() - toolStart,
+          });
+
+          toolResultBlocks.push({ type: "tool_result", tool_use_id: block.id, content: JSON.stringify(result) });
+        } catch (err: any) {
+          console.error(`[ORCHESTRATOR] Tool execution error: ${toolName}`, err.message);
+
+          auditLogger.log({
+            conversationId,
+            userId: "admin-dev",
+            toolName,
+            actionCategory: toolName === "create_lead" ? "WRITE" : "READ",
+            status: "error",
+            durationMs: Date.now() - toolStart,
+            message: err.message,
+          });
+
+          toolResultBlocks.push({
+            type: "tool_result",
+            tool_use_id: block.id,
+            content: JSON.stringify({ error: err.message, status: "error" }),
+            is_error: true,
+          });
+        }
+      }
+
+      messages.push({ role: "user", content: toolResultBlocks });
+    }
+
+    // Pass 2: force the structured render_workspace_ui tool call so we always get
+    // validated JSON back, whether or not a CRM tool was needed this turn.
+    const pass2 = await anthropic.messages.create({
+      model,
+      system: systemPrompt,
+      max_tokens: 4096,
+      temperature: 0.2,
+      messages,
+      tools: [RENDER_UI_TOOL],
+      tool_choice: { type: "tool", name: "render_workspace_ui" },
+    });
+
+    const renderBlock = pass2.content.find(
+      (b): b is Anthropic.ToolUseBlock => b.type === "tool_use" && b.name === "render_workspace_ui"
+    );
+    if (!renderBlock) {
+      throw new Error("Claude did not return a render_workspace_ui tool call");
+    }
+
+    const validated = AIWorkspaceResponseSchema.parse(renderBlock.input);
+    validated.metadata = {
+      toolsUsed,
+      executionTime: Date.now() - startTime,
+    };
+    return validated;
+  }
+
+  private async processWithOpenAI(
+    userMessage: string,
+    conversationId: string,
+    mode: "corporate" | "retail",
+    history: any[],
+    systemPrompt: string,
+    startTime: number
+  ): Promise<AIWorkspaceResponse> {
+    const openai = this.openai!;
+    const model = process.env.OPENAI_MODEL || "gpt-5.6-terra";
+    const toolsUsed: string[] = [];
+
+    // 1. Discover tools from MCP server
+    const mcpTools = await this.mcpClient.listTools();
+
+    // 2. Filter tools based on active workspace mode
+    const filteredMcpTools = this.filterCrmTools(mcpTools, mode);
+
+    const openaiTools = filteredMcpTools.map((t) => ({
+      type: "function" as const,
+      function: {
+        name: t.name,
+        description: t.description || "",
+        parameters: {
+          type: t.inputSchema.type,
+          properties: t.inputSchema.properties,
+          required: t.inputSchema.required,
+        },
+      },
+    }));
+
+    const messages: any[] = [{ role: "system", content: systemPrompt }];
+
+    // 3. Append history logs
+    if (Array.isArray(history)) {
+      for (const msg of history) {
+        messages.push({
+          role: msg.role === "assistant" ? "assistant" : "user",
+          content: msg.content,
+        });
+      }
+    }
+
+    // Append current query
+    messages.push({ role: "user", content: userMessage });
+
+    // 4. First completion pass (with tool definitions)
+    const response = await openai.chat.completions.create({
+      model: model.includes("gpt-5.6") ? "gpt-4o" : model,
+      messages,
+      tools: openaiTools.length > 0 ? openaiTools : undefined,
+      temperature: 0.2,
+    });
+
+    const choice = response.choices[0];
+    const messageResponse = choice?.message;
+
+    // 5. Check for tool executions requested by the AI
+    if (messageResponse?.tool_calls && messageResponse.tool_calls.length > 0) {
+      console.log(`[ORCHESTRATOR] OpenAI requested ${messageResponse.tool_calls.length} tool call(s).`);
+      messages.push(messageResponse);
+
+      for (const toolCall of messageResponse.tool_calls as any[]) {
+        const toolName = toolCall.function.name;
+        const toolArgs = JSON.parse(toolCall.function.arguments || "{}");
+        console.log(`[ORCHESTRATOR] Executing tool ${toolName} in real-time...`, toolArgs);
+
+        const toolStart = Date.now();
+        toolsUsed.push(toolName);
+        let resultText = "";
+
+        try {
+          const result = await this.mcpClient.callTool(toolName, toolArgs);
+          this.cacheEntity(conversationId, toolName, toolArgs, result);
+          resultText = JSON.stringify(result);
+
+          auditLogger.log({
+            conversationId,
+            userId: "admin-dev",
+            toolName,
+            actionCategory: toolName === "create_lead" ? "WRITE" : "READ",
+            status: "success",
+            durationMs: Date.now() - toolStart,
+          });
+        } catch (err: any) {
+          console.error(`[ORCHESTRATOR] Real-time tool execution error: ${toolName}`, err.message);
+          resultText = JSON.stringify({ error: err.message, status: "error" });
+
+          auditLogger.log({
+            conversationId,
+            userId: "admin-dev",
+            toolName,
+            actionCategory: toolName === "create_lead" ? "WRITE" : "READ",
+            status: "error",
+            durationMs: Date.now() - toolStart,
+            message: err.message,
+          });
+        }
+
+        messages.push({
+          role: "tool",
+          tool_call_id: toolCall.id,
+          content: resultText,
+        });
+      }
+
+      // 6. Second completion pass (returns structured UI schema based on tool results)
+      console.log("[ORCHESTRATOR] Calling OpenAI second completion pass...");
+      const secondResponse = await openai.chat.completions.create({
+        model: model.includes("gpt-5.6") ? "gpt-4o" : model,
+        messages,
+        temperature: 0.2,
+        response_format: { type: "json_object" },
+      });
+
+      const content = secondResponse.choices[0]?.message?.content || "";
+      const parsed = JSON.parse(content);
+      const validated = AIWorkspaceResponseSchema.parse(parsed);
+
+      validated.metadata = {
+        toolsUsed,
+        executionTime: Date.now() - startTime,
+      };
+
+      return validated;
+    }
+
+    // Handle direct text/JSON response if no tools were called (e.g. conversational follow-ups)
+    const content = messageResponse?.content || "";
+    const parsed = JSON.parse(content);
+    const validated = AIWorkspaceResponseSchema.parse(parsed);
+
+    validated.metadata = {
+      toolsUsed: [],
+      executionTime: Date.now() - startTime,
+    };
+
+    return validated;
   }
 
   private async fallbackSemanticRouting(
@@ -202,7 +448,7 @@ export class AIOrchestrator {
     // Parse history to check if we just retrieved a Customer 360 or Lead Profile
     let lastRetrievedCustomer: string | null = null;
     let lastRetrievedLead: string | null = null;
-    
+
     if (Array.isArray(history)) {
       for (let i = history.length - 1; i >= 0; i--) {
         const msg = history[i];
@@ -225,24 +471,24 @@ export class AIOrchestrator {
     // A. CONVERSATIONAL CONTEXT CHECK
     // Determine if user is issuing a search or a follow-up
     const hasId = message.match(/\b\d{4,5}\b/);
-    const isNewSearch = 
-      lowerMessage.includes("ryan") || 
-      lowerMessage.includes("gates") || 
-      lowerMessage.includes("petronas") || 
-      lowerMessage.includes("babu") || 
-      lowerMessage.includes("thomas") || 
-      lowerMessage.includes("hunnu") || 
-      lowerMessage.includes("anushka") || 
-      lowerMessage.includes("singhania") || 
-      lowerMessage.includes("jatin") || 
-      lowerMessage.includes("deshmukh") || 
+    const isNewSearch =
+      lowerMessage.includes("ryan") ||
+      lowerMessage.includes("gates") ||
+      lowerMessage.includes("petronas") ||
+      lowerMessage.includes("babu") ||
+      lowerMessage.includes("thomas") ||
+      lowerMessage.includes("hunnu") ||
+      lowerMessage.includes("anushka") ||
+      lowerMessage.includes("singhania") ||
+      lowerMessage.includes("jatin") ||
+      lowerMessage.includes("deshmukh") ||
       hasId;
 
     const isFollowUp = (lastRetrievedCustomer || lastRetrievedLead) && !isNewSearch;
 
     if (isFollowUp) {
       console.log(`[ORCHESTRATOR] Conversational follow-up query matched. Context: Customer=${lastRetrievedCustomer}, Lead=${lastRetrievedLead}`);
-      
+
       let replyMessage = "I have reviewed our conversation context. ";
       let cardTitle = "Conversational CRM Answer";
       let summaryData: any = {};
@@ -250,15 +496,15 @@ export class AIOrchestrator {
       let customComponents: any[] = [];
 
       // Check if user is requesting to change layout/UI
-      const isLayoutChangeRequest = 
-        lowerMessage.includes("layout") || 
-        lowerMessage.includes("ui") || 
-        lowerMessage.includes("column") || 
-        lowerMessage.includes("view") || 
-        lowerMessage.includes("change") || 
-        lowerMessage.includes("different") || 
-        lowerMessage.includes("grid") || 
-        lowerMessage.includes("rearrange") || 
+      const isLayoutChangeRequest =
+        lowerMessage.includes("layout") ||
+        lowerMessage.includes("ui") ||
+        lowerMessage.includes("column") ||
+        lowerMessage.includes("view") ||
+        lowerMessage.includes("change") ||
+        lowerMessage.includes("different") ||
+        lowerMessage.includes("grid") ||
+        lowerMessage.includes("rearrange") ||
         lowerMessage.includes("horizontal") ||
         lowerMessage.includes("vertical");
 
@@ -271,7 +517,7 @@ export class AIOrchestrator {
           replyMessage = `I have reorganized the UI layout for ${clientName}'s Customer 360 into a consolidated single-column view.`;
           cardTitle = `${clientName} - Modified Layout`;
           customLayout = { type: "detail", columns: 1 };
-          
+
           if (isRetail) {
             customComponents = [
               {
@@ -335,7 +581,7 @@ export class AIOrchestrator {
               }
             ];
           }
-        } 
+        }
         // Handle other details follow-ups
         else if (lowerMessage.includes("rm") || lowerMessage.includes("manager") || lowerMessage.includes("assigned")) {
           const rm = isRetail ? "Mr. Ranjan Sharma" : "Mr. Shaukat Ahmad";
@@ -367,7 +613,7 @@ export class AIOrchestrator {
           cardTitle = "Next Best Offer";
           summaryData = { "Next Best Offer": offer, "Target Customer": clientName };
         } else if (lowerMessage.includes("strengths") || lowerMessage.includes("weakness")) {
-          replyMessage += isRetail 
+          replyMessage += isRetail
             ? `Ryan Gates shows strong HNWI Segment tags. Churn propensity is flagged as high, recommended for Top-Up offer.`
             : `Petronas Malaysia strengths include strong brand presence and versatile manufacturing capacity, balanced against historical labor strikes.`;
           cardTitle = "Business Profile Insights";
@@ -550,7 +796,9 @@ export class AIOrchestrator {
         try {
           const leadMatch = message.match(/\b\d{5}\b/);
           const leadId = leadMatch ? leadMatch[0] : "13314";
-          const result = await this.mcpClient.callTool("get_retail_lead", { lead_id: leadId });
+          const args = { lead_id: leadId };
+          const result = await this.mcpClient.callTool("get_retail_lead", args);
+          this.cacheEntity(conversationId, "get_retail_lead", args, result);
           logReadAudit("get_retail_lead", Date.now() - toolStart);
 
           const leadData = result.lead?.result?.[0] || result.lead || result;
@@ -558,7 +806,7 @@ export class AIOrchestrator {
           const leadOwner = leadData["Lead Owner"] || "Mr. James May";
           const product = leadData.product || "Home Loan";
           const status = leadData["Status Code"] || "Finance Disbursed";
-          
+
           return {
             version: "1.0",
             title: `${leadName} - Retail Lead Profile`,
@@ -616,16 +864,16 @@ export class AIOrchestrator {
 
       // INTENT R.2: Retail Customer Lookup (e.g. "customer 2356", "Ryan Gates", "gates", "jatin")
       // Only execute if it matches customer keyword or name or id
-      const isCustomerSearch = 
-        lowerMessage.includes("ryan") || 
-        lowerMessage.includes("gates") || 
-        lowerMessage.includes("customer") || 
-        lowerMessage.includes("account") || 
-        lowerMessage.includes("cif") || 
-        lowerMessage.includes("jatin") || 
-        lowerMessage.includes("deshmukh") || 
-        lowerMessage.includes("baby") || 
-        lowerMessage.includes("kumar") || 
+      const isCustomerSearch =
+        lowerMessage.includes("ryan") ||
+        lowerMessage.includes("gates") ||
+        lowerMessage.includes("customer") ||
+        lowerMessage.includes("account") ||
+        lowerMessage.includes("cif") ||
+        lowerMessage.includes("jatin") ||
+        lowerMessage.includes("deshmukh") ||
+        lowerMessage.includes("baby") ||
+        lowerMessage.includes("kumar") ||
         message.match(/\b\d{4}\b/);
 
       if (isCustomerSearch) {
@@ -634,7 +882,9 @@ export class AIOrchestrator {
         try {
           const idMatch = message.match(/\b\d{4}\b/);
           const accountId = idMatch ? idMatch[0] : (lowerMessage.includes("jatin") || lowerMessage.includes("deshmukh") ? "2571" : (lowerMessage.includes("baby") || lowerMessage.includes("kumar") ? "2593" : "2356"));
-          const result = await this.mcpClient.callTool("get_retail_account", { account_id: accountId });
+          const args = { account_id: accountId };
+          const result = await this.mcpClient.callTool("get_retail_account", args);
+          this.cacheEntity(conversationId, "get_retail_account", args, result);
           logReadAudit("get_retail_account", Date.now() - toolStart);
 
           const accountData = result.account?.result?.[0] || result.account || result;
@@ -710,11 +960,13 @@ export class AIOrchestrator {
       if (lowerMessage.includes("babu") || lowerMessage.includes("thomas") || lowerMessage.includes("petronas") || lowerMessage.includes("account") || lowerMessage.includes("customer") || lowerMessage.includes("cif") || lowerMessage.includes("hunnu") || message.match(/\b\d{4}\b/)) {
         const toolStart = Date.now();
         toolsUsed.push("get_account");
-        
+
         try {
           const idMatch = message.match(/\b\d{4}\b/);
           const accountId = idMatch ? idMatch[0] : "2463";
-          const result = await this.mcpClient.callTool("get_account", { account_id: accountId });
+          const args = { account_id: accountId };
+          const result = await this.mcpClient.callTool("get_account", args);
+          this.cacheEntity(conversationId, "get_account", args, result);
           logReadAudit("get_account", Date.now() - toolStart);
 
           const accountData = result.account?.result?.[0] || result.account || result;
