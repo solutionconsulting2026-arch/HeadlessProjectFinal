@@ -71,6 +71,21 @@ const RENDER_UI_TOOL: Anthropic.Tool = {
   },
 };
 
+// Tracks which LLM provider is actually configured and whether the *last* real call to
+// it succeeded, as opposed to just whether an API key string is present. The admin page's
+// "Connected" badges previously only checked process.env.OPENAI_API_KEY truthiness, which
+// is true even for an invalid/placeholder key — this is what makes the app silently run the
+// local fallback router while still showing "Connected" and a real-looking (but static)
+// response. Same in-memory-per-server-instance pattern as mcpDiagnostics/auditLogger.
+class LLMDiagnosticsTracker {
+  public configuredProvider: "anthropic" | "openai" | "none" = "none";
+  public lastUsedProvider: "anthropic" | "openai" | "fallback" | null = null;
+  public lastError: string | null = null;
+  public lastErrorProvider: "anthropic" | "openai" | null = null;
+  public lastSuccessAt: number | null = null;
+}
+export const llmDiagnostics = new LLMDiagnosticsTracker();
+
 export class AIOrchestrator {
   private openai: OpenAI | null = null;
   private anthropic: Anthropic | null = null;
@@ -98,6 +113,8 @@ export class AIOrchestrator {
     if (!this.anthropic && !this.openai) {
       console.warn("[ORCHESTRATOR] No ANTHROPIC_API_KEY or OPENAI_API_KEY defined. Falling back to local semantic parser.");
     }
+
+    llmDiagnostics.configuredProvider = this.anthropic ? "anthropic" : this.openai ? "openai" : "none";
   }
 
   private cacheEntity(conversationId: string, toolName: string, args: Record<string, any>, rawResult: any) {
@@ -162,6 +179,19 @@ export class AIOrchestrator {
     return mode === "retail" ? "Home Loan" : "Personal Loan for Salaried Customers";
   }
 
+  // Mirrors the category-inference keyword logic in the CRM MCP server's own create_lead
+  // tool (headlessmcp/server.py) so the confirmation card we show the user for approval
+  // previews the SAME category the server will actually resolve, instead of always
+  // showing the static "Loans" default regardless of the real product.
+  private detectProductCategory(product: string): string {
+    const p = product.toLowerCase();
+    if (p.includes("loan") || p.includes("mortgage") || p.includes("financing")) return "Loans";
+    if (p.includes("card") || p.includes("visa") || p.includes("mastercard") || p.includes("amex")) return "Credit Card";
+    if (p.includes("account") || p.includes("deposit") || p.includes("saver") || p.includes("demat")) return "Accounts";
+    if (p.includes("finance")) return "Finances";
+    return "Loans";
+  }
+
   private filterCrmTools(mcpTools: McpTool[], mode: "corporate" | "retail"): McpTool[] {
     return mcpTools.filter((t) => {
       if (mode === "retail") {
@@ -185,21 +215,34 @@ export class AIOrchestrator {
 
     if (this.anthropic) {
       try {
-        return await this.processWithAnthropic(userMessage, conversationId, mode, history, systemPrompt, startTime);
+        const result = await this.processWithAnthropic(userMessage, conversationId, mode, history, systemPrompt, startTime);
+        llmDiagnostics.lastUsedProvider = "anthropic";
+        llmDiagnostics.lastError = null;
+        llmDiagnostics.lastSuccessAt = Date.now();
+        return result;
       } catch (err: any) {
         console.error("[ORCHESTRATOR] Anthropic agent loop failed, falling back.", err.message);
+        llmDiagnostics.lastError = err.message;
+        llmDiagnostics.lastErrorProvider = "anthropic";
       }
     }
 
     if (this.openai) {
       try {
-        return await this.processWithOpenAI(userMessage, conversationId, mode, history, systemPrompt, startTime);
+        const result = await this.processWithOpenAI(userMessage, conversationId, mode, history, systemPrompt, startTime);
+        llmDiagnostics.lastUsedProvider = "openai";
+        llmDiagnostics.lastError = null;
+        llmDiagnostics.lastSuccessAt = Date.now();
+        return result;
       } catch (err: any) {
         console.error("[ORCHESTRATOR] OpenAI agent loop failed, falling back to semantic parser.", err.message);
+        llmDiagnostics.lastError = err.message;
+        llmDiagnostics.lastErrorProvider = "openai";
       }
     }
 
     // Local Semantic Parser Fallback (interacts with the LIVE MCP server)
+    llmDiagnostics.lastUsedProvider = "fallback";
     return this.fallbackSemanticRouting(userMessage, conversationId, startTime, mode, history);
   }
 
@@ -782,21 +825,37 @@ export class AIOrchestrator {
     // 2. LEAD CREATION INTENT (Common to both modes)
     if (lowerMessage.includes("create") || lowerMessage.includes("save") || (lowerMessage.includes("lead") && !lowerMessage.includes("show") && !lowerMessage.includes("find") && !lowerMessage.includes("get") && !message.match(/\b\d{5}\b/))) {
       // Explicit "lead for First Last" always wins. Otherwise, if the message references
-      // an already-established entity ("that customer", "them", or just no name at all),
-      // reuse the real record from this conversation's cache instead of a demo placeholder.
-      // A pronoun/placeholder stoplist keeps "lead for that customer" from being
-      // misread as a literal first/last name ("That Customer").
+      // an already-established entity ("that customer", "them", "jatin" who was just
+      // fetched, or just no name at all), reuse the real record from this conversation's
+      // cache instead of a demo placeholder.
+      // A pronoun stoplist keeps "lead for that customer" from being misread as a literal
+      // first name ("That"). A separate name-stoplist catches connector/filler words the
+      // naive regex still captures as a "last name" from sentences like "lead for jatin
+      // for credit card" (where "for" is NOT a last name, it's the next clause).
       const PRONOUN_STOPLIST = new Set(["that", "this", "them", "him", "her", "the", "same", "said", "customer", "client", "account", "lead"]);
+      const NAME_STOPLIST = new Set(["for", "to", "with", "and", "about", "regarding", "on", "of", "a", "an", "please", "who", "product", "card", "loan", "account", "offer"]);
       const rawNameMatch = message.match(/lead (?:for|called) ([A-Za-z]+)\s*([A-Za-z]*)/i) || [];
-      const isRealName = !!rawNameMatch[1] && !PRONOUN_STOPLIST.has(rawNameMatch[1].toLowerCase());
+      const capturedFirst = rawNameMatch[1];
+      const capturedLast = rawNameMatch[2];
       const cachedContact = this.getLastCachedContact(conversationId);
-      const name = (isRealName && rawNameMatch[1]) || cachedContact?.name || "Anushka";
-      const lastName = (isRealName && rawNameMatch[2]) || cachedContact?.lastName || "Singhania";
+
+      const isRealFirstName = !!capturedFirst && !PRONOUN_STOPLIST.has(capturedFirst.toLowerCase());
+      // "lead for jatin ..." where Jatin Deshmukh was already fetched: trust the cache for
+      // the FULL name instead of whatever the regex grabbed as a second word.
+      const matchesCachedFirstName = isRealFirstName && !!cachedContact && capturedFirst!.toLowerCase() === cachedContact.name.toLowerCase();
+      const isDifferentPerson = isRealFirstName && !matchesCachedFirstName;
+      const isRealLastName = !!capturedLast && !PRONOUN_STOPLIST.has(capturedLast.toLowerCase()) && !NAME_STOPLIST.has(capturedLast.toLowerCase());
+
+      const name = (isDifferentPerson && capturedFirst) || cachedContact?.name || "Anushka";
+      const lastName = isDifferentPerson
+        ? (isRealLastName && capturedLast) || "Singhania"
+        : cachedContact?.lastName || "Singhania";
       const phoneMatch = message.match(/(\d[\d-\s]{7,\d})/);
-      // Only reuse the cached phone when we're actually reusing that cached person's name too —
-      // an explicit different name shouldn't inherit someone else's phone number.
-      const mobilePhone = phoneMatch ? phoneMatch[0].trim() : (!isRealName && cachedContact?.phone) || "9999927066";
+      // Only reuse the cached phone when we're actually reusing that cached person's identity —
+      // an explicitly different person shouldn't inherit someone else's phone number.
+      const mobilePhone = phoneMatch ? phoneMatch[0].trim() : (!isDifferentPerson && cachedContact?.phone) || "9999927066";
       const product = this.detectRequestedProduct(message, mode);
+      const productCategory = this.detectProductCategory(product);
 
       return {
         version: "1.0",
@@ -815,7 +874,7 @@ export class AIOrchestrator {
                 last_name: lastName,
                 mobile_phone: mobilePhone,
                 product,
-                product_category: "Loans",
+                product_category: productCategory,
                 lead_owner_name: "Mr. James May",
                 rating: "Warm"
               }

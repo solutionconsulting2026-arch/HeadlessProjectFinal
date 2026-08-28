@@ -92,23 +92,59 @@ export default function AdminIntegrations() {
 
           {/* OpenAI Status Card */}
           <div className="rounded-lg border border-[#E5E7EB] bg-white p-6 shadow-sm">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center space-x-3">
-                <div className="rounded-full bg-pink-50 p-2 text-[#E71A73]">
-                  <Activity className="h-6 w-6" />
-                </div>
-                <div>
-                  <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider">OpenAI API</h3>
-                  <p className="text-lg font-bold text-gray-800">gpt-5.6-terra</p>
-                </div>
-              </div>
-              <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ${
-                data?.connectionStatus === "Error" ? "bg-red-50 text-red-700" : "bg-green-50 text-green-700"
-              }`}>
-                <CheckCircle2 className="mr-1 h-3.5 w-3.5" />
-                Connected
-              </span>
-            </div>
+            {(() => {
+              const llm = data?.llmProvider;
+              const configured = llm?.configured || "none";
+              const hasRecentError = !!llm?.lastError;
+              const providerLabel = configured === "anthropic" ? "Anthropic API" : configured === "openai" ? "OpenAI API" : "AI Provider";
+              const badgeLabel = configured === "none"
+                ? "Not Configured"
+                : hasRecentError
+                ? `Last call failed (${llm.lastErrorProvider})`
+                : llm?.lastUsedProvider && llm.lastUsedProvider !== "fallback"
+                ? "Connected — verified"
+                : `${configured === "anthropic" ? "Anthropic" : "OpenAI"} key present`;
+              const badgeTone = configured === "none"
+                ? "bg-gray-100 text-gray-600"
+                : hasRecentError
+                ? "bg-red-50 text-red-700"
+                : llm?.lastUsedProvider && llm.lastUsedProvider !== "fallback"
+                ? "bg-green-50 text-green-700"
+                : "bg-amber-50 text-amber-700";
+              return (
+                <>
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center space-x-3">
+                      <div className="rounded-full bg-pink-50 p-2 text-[#E71A73]">
+                        <Activity className="h-6 w-6" />
+                      </div>
+                      <div>
+                        <h3 className="text-sm font-semibold text-gray-500 uppercase tracking-wider">{providerLabel}</h3>
+                        <p className="text-lg font-bold text-gray-800">{llm?.model || "—"}</p>
+                      </div>
+                    </div>
+                    <span className={`inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-semibold ${badgeTone}`}>
+                      {hasRecentError || configured === "none" ? (
+                        <ShieldAlert className="mr-1 h-3.5 w-3.5" />
+                      ) : (
+                        <CheckCircle2 className="mr-1 h-3.5 w-3.5" />
+                      )}
+                      {badgeLabel}
+                    </span>
+                  </div>
+                  {hasRecentError && (
+                    <p className="mt-3 text-xs text-red-600 font-mono truncate" title={llm.lastError}>
+                      {llm.lastError}
+                    </p>
+                  )}
+                  {!hasRecentError && configured !== "none" && (!llm?.lastUsedProvider || llm.lastUsedProvider === "fallback") && (
+                    <p className="mt-3 text-xs text-amber-600">
+                      Key present, but no successful call recorded yet this session — a truly invalid key will show up here as &ldquo;Last call failed&rdquo; after the next query.
+                    </p>
+                  )}
+                </>
+              );
+            })()}
           </div>
 
           {/* MCP Server Status Card */}
